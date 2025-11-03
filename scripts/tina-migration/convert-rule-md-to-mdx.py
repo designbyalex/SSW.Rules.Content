@@ -941,7 +941,7 @@ def build_category_uri_to_path_map(categories_root='categories'):
     return uri_to_path
 
 def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_path):
-    """Update or add categories to an MDX file's frontmatter."""
+    """Update or add categories to an MDX file's frontmatter, placing it right after title."""
     path = Path(mdx_file_path)
     if not path.exists():
         print(f"[WARNING] File not found: {mdx_file_path}")
@@ -960,12 +960,16 @@ def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_pat
     fm_suffix = fm_match.group(3)
     body = content[fm_match.end():]
     
-    # Parse frontmatter - preserve original lines for non-category fields
+    # Split frontmatter into lines for precise manipulation
     fm_lines = fm_text.split('\n')
-    fm_data = parse_frontmatter(fm_text)
     
-    # Get rule URI
-    rule_uri = fm_data.get('uri', '')
+    # Get rule URI - try parsing just the uri field
+    rule_uri = None
+    for line in fm_lines:
+        if line.strip().startswith('uri:'):
+            rule_uri = line.split(':', 1)[1].strip()
+            break
+    
     if not rule_uri:
         # Try to get URI from folder name
         rule_uri = path.parent.name
@@ -980,61 +984,131 @@ def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_pat
         # No categories to add, skip
         return False
     
-    # Get existing categories if any
-    existing_categories = fm_data.get('categories', [])
+    # Extract existing categories and their paths
     existing_category_paths = set()
+    categories_start_idx = None
+    categories_end_idx = None
+    in_categories_block = False
     
-    # Extract existing category paths
-    if isinstance(existing_categories, list):
-        for cat in existing_categories:
-            if isinstance(cat, dict) and 'category' in cat:
-                existing_category_paths.add(cat['category'])
-            elif isinstance(cat, str):
-                # Handle if categories is a list of strings
-                existing_category_paths.add(cat)
+    for i, line in enumerate(fm_lines):
+        stripped = line.strip()
+        if stripped.startswith('categories:'):
+            categories_start_idx = i
+            in_categories_block = True
+            # Extract existing category paths from subsequent lines
+            continue
+        elif in_categories_block:
+            if stripped.startswith('- category:'):
+                cat_path = stripped.split(':', 1)[1].strip()
+                existing_category_paths.add(cat_path)
+            elif stripped.startswith('- '):
+                # Other list item in categories
+                cat_val = stripped[2:].strip()
+                existing_category_paths.add(cat_val)
+            elif stripped and not line.strip().startswith('-') and ':' in stripped:
+                # New key encountered, end of categories block
+                categories_end_idx = i
+                in_categories_block = False
+            elif not stripped:
+                # Empty line might be within categories or after
+                continue
+    
+    if in_categories_block:
+        categories_end_idx = len(fm_lines)
     
     # Build new categories list
-    new_categories = []
+    new_categories_to_add = []
     
-    # Preserve existing categories
-    if isinstance(existing_categories, list):
-        for cat in existing_categories:
-            if isinstance(cat, dict) and 'category' in cat:
-                new_categories.append(cat)
-            elif isinstance(cat, str):
-                new_categories.append({'category': cat})
-    
-    # Add new categories from mapping
+    # Add new categories from mapping that don't already exist
     for category_uri in category_uris:
         category_path = category_uri_to_path.get(category_uri)
-        if category_path:
-            # Check if already exists
-            if category_path not in existing_category_paths:
-                new_categories.append({'category': category_path})
-        else:
+        if category_path and category_path not in existing_category_paths:
+            new_categories_to_add.append(category_path)
+        elif not category_path:
             print(f"[WARNING] Could not find path for category URI: {category_uri} for rule: {rule_uri}")
     
     # Check if we need to update
-    needs_update = False
-    if new_categories and len(new_categories) != len(existing_categories):
-        needs_update = True
-    elif new_categories:
-        # Check if all existing categories are still there and if any new ones were added
-        new_paths = {cat.get('category') if isinstance(cat, dict) else cat for cat in new_categories}
-        if new_paths != existing_category_paths:
-            needs_update = True
+    if not new_categories_to_add and categories_start_idx is not None:
+        # Categories exist and no new ones to add
+        return False
     
-    if needs_update:
-        fm_data['categories'] = new_categories
-        
-        # Format and write back - preserve other fields as-is
-        new_fm_text = format_frontmatter(fm_data)
-        new_content = fm_prefix + new_fm_text + fm_suffix + body
-        
-        path.write_text(new_content, encoding='utf-8')
-        return True
+    # Find title line index
+    title_idx = None
+    for i, line in enumerate(fm_lines):
+        if line.strip().startswith('title:'):
+            title_idx = i
+            break
     
-    return False
+    if title_idx is None:
+        print(f"[WARNING] Could not find 'title:' field in: {mdx_file_path}")
+        return False
+    
+    # Collect all category paths (existing + new)
+    all_category_paths = set(existing_category_paths)
+    all_category_paths.update(new_categories_to_add)
+    
+    # Only proceed if we have categories to add/update
+    if not all_category_paths:
+        return False
+    
+    # Check if categories are already correctly positioned right after title
+    categories_correctly_placed = False
+    if categories_start_idx is not None:
+        # Check if categories block starts right after title (with possible empty lines)
+        # Allow for 0-1 empty lines between title and categories
+        expected_range = range(title_idx + 1, title_idx + 4)  # Allow 1-3 lines after title
+        if categories_start_idx in expected_range:
+            # Categories are in the right place, check if content matches
+            expected_paths = set()
+            for category_uri in category_uris:
+                category_path = category_uri_to_path.get(category_uri)
+                if category_path:
+                    expected_paths.add(category_path)
+            
+            # If existing categories match expected (at least - may have more)
+            if existing_category_paths >= expected_paths:
+                categories_correctly_placed = True
+    
+    # If categories are correctly placed and have all expected paths, no update needed
+    if categories_correctly_placed and not new_categories_to_add:
+        return False
+    
+    # Build new frontmatter lines - preserve everything exactly except categories placement
+    new_fm_lines = []
+    insert_categories_after = title_idx
+    
+    # Determine what to skip (the old categories block if it exists)
+    skip_range = set()
+    if categories_start_idx is not None:
+        skip_range = set(range(categories_start_idx, categories_end_idx))
+    
+    # Process each line, inserting categories after title
+    for i in range(len(fm_lines)):
+        # If this is where title ends, insert categories here
+        if i == insert_categories_after:
+            new_fm_lines.append(fm_lines[i])  # Add title line
+            
+            # Insert categories right after title
+            new_fm_lines.append('categories:')
+            for cat_path in sorted(all_category_paths):  # Sort for consistency
+                new_fm_lines.append(f"  - category: {cat_path}")
+            
+            # Continue to next iteration to skip old categories block if it exists
+            continue
+        
+        # Skip lines that are part of the old categories block
+        if i in skip_range:
+            continue
+        
+        # Add all other lines as-is
+        new_fm_lines.append(fm_lines[i])
+    
+    # Reconstruct the file
+    new_fm_text = '\n'.join(new_fm_lines)
+    new_content = fm_prefix + new_fm_text + fm_suffix + body
+    
+    path.write_text(new_content, encoding='utf-8')
+    return True
 
 def update_all_mdx_categories(rules_dir='public/uploads/rules', rule_to_categories_file='rule-to-categories.json'):
     """Update categories in all rule.mdx files."""
