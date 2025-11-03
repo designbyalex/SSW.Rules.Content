@@ -666,7 +666,7 @@ def transform_email_blocks(content: str) -> str:
 # Main Transform Function
 # ----------------------------- #
 
-def transform_md_to_mdx(file_path):
+def transform_md_to_mdx(file_path, rule_to_categories=None, category_uri_to_path=None):
     path = Path(file_path)
     if not path.exists():
         print(f"File not found: {file_path}")
@@ -720,21 +720,46 @@ def transform_md_to_mdx(file_path):
     output_path.write_text(content, encoding='utf-8')
 
     print(f"Transformed content saved to: {output_path}")
+    
+    # Add categories to the newly converted MDX file if mappings are provided
+    if rule_to_categories is not None and category_uri_to_path is not None:
+        try:
+            update_mdx_categories(str(output_path), rule_to_categories, category_uri_to_path)
+        except Exception as e:
+            print(f"[WARNING] Failed to add categories to {output_path}: {e}")
+    
     path.unlink()  # delete original .md file
 
-def transform_all_mds(base_dir=DEFAULT_BASE_DIR, file_name=DEFAULT_FILE_NAME):
+def transform_all_mds(base_dir=DEFAULT_BASE_DIR, file_name=DEFAULT_FILE_NAME, add_categories=False):
     """
     Transform all Markdown (.md) files in each subdirectory of the given base directory.
 
     :param base_dir: The base directory containing rule folders.
     :param file_name: The specific file name to look for in each folder. If None, process any .md file.
-    :param ignore_files: A list of file names to ignore.
+    :param add_categories: If True, load category mappings and add categories to converted MDX files.
     """
     start_time = time.time()
     base_path = Path(base_dir)
     if not base_path.exists():
         print(f"Base path not found: {base_dir}")
         return
+
+    # Load category mappings if requested
+    rule_to_categories = None
+    category_uri_to_path = None
+    if add_categories:
+        script_dir = Path(__file__).parent
+        repo_root = script_dir.parent.parent
+        rule_to_cats_path = repo_root / 'rule-to-categories.json'
+        
+        if rule_to_cats_path.exists():
+            with open(rule_to_cats_path, 'r', encoding='utf-8') as f:
+                rule_to_categories = json.load(f)
+            print("[INFO] Loaded rule-to-categories mapping.")
+            category_uri_to_path = build_category_uri_to_path_map()
+            print(f"[INFO] Built category URI to path mapping ({len(category_uri_to_path)} categories).")
+        else:
+            print(f"[WARNING] rule-to-categories.json not found, skipping category updates.")
 
     count = 0
     for rule_dir in base_path.iterdir():
@@ -754,7 +779,7 @@ def transform_all_mds(base_dir=DEFAULT_BASE_DIR, file_name=DEFAULT_FILE_NAME):
 
             print(f"[INFO] Processing: {rule_md}")
             try:
-                transform_md_to_mdx(rule_md)
+                transform_md_to_mdx(rule_md, rule_to_categories, category_uri_to_path)
                 count += 1
             except Exception as e:
                 print(f"[ERROR] Failed to process {rule_md}: {e}")
@@ -1019,18 +1044,6 @@ def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_pat
     # Build new categories list
     new_categories_to_add = []
     
-    # Add new categories from mapping that don't already exist
-    for category_uri in category_uris:
-        category_path = category_uri_to_path.get(category_uri)
-        if category_path and category_path not in existing_category_paths:
-            new_categories_to_add.append(category_path)
-        elif not category_path:
-            print(f"[WARNING] Could not find path for category URI: {category_uri} for rule: {rule_uri}")
-    
-    # Check if we need to update
-    if not new_categories_to_add and categories_start_idx is not None:
-        # Categories exist and no new ones to add
-        return False
     
     # Find title line index
     title_idx = None
@@ -1043,34 +1056,31 @@ def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_pat
         print(f"[WARNING] Could not find 'title:' field in: {mdx_file_path}")
         return False
     
-    # Collect all category paths (existing + new)
-    all_category_paths = set(existing_category_paths)
-    all_category_paths.update(new_categories_to_add)
+    # Sync categories: use only the categories from the mapping (remove extras, add missing)
+    expected_category_paths = set()
+    for category_uri in category_uris:
+        category_path = category_uri_to_path.get(category_uri)
+        if category_path:
+            expected_category_paths.add(category_path)
+        elif not category_path:
+            print(f"[WARNING] Could not find path for category URI: {category_uri} for rule: {rule_uri}")
     
-    # Only proceed if we have categories to add/update
-    if not all_category_paths:
+    # If no categories expected and none exist, nothing to do
+    if not expected_category_paths and not existing_category_paths:
         return False
     
-    # Check if categories are already correctly positioned right after title
-    categories_correctly_placed = False
-    if categories_start_idx is not None:
-        # Check if categories block starts right after title (with possible empty lines)
-        # Allow for 0-1 empty lines between title and categories
-        expected_range = range(title_idx + 1, title_idx + 4)  # Allow 1-3 lines after title
-        if categories_start_idx in expected_range:
-            # Categories are in the right place, check if content matches
-            expected_paths = set()
-            for category_uri in category_uris:
-                category_path = category_uri_to_path.get(category_uri)
-                if category_path:
-                    expected_paths.add(category_path)
-            
-            # If existing categories match expected (at least - may have more)
-            if existing_category_paths >= expected_paths:
-                categories_correctly_placed = True
+    # Determine if update is needed (categories differ from expected or incorrectly placed)
+    categories_differ = expected_category_paths != existing_category_paths
+    categories_incorrectly_placed = False
     
-    # If categories are correctly placed and have all expected paths, no update needed
-    if categories_correctly_placed and not new_categories_to_add:
+    if categories_start_idx is not None:
+        # Check if categories are correctly placed right after title
+        expected_range = range(title_idx + 1, title_idx + 4)  # Allow 1-3 lines after title
+        if categories_start_idx not in expected_range:
+            categories_incorrectly_placed = True
+    
+    # If categories match and are correctly placed, no update needed
+    if not categories_differ and not categories_incorrectly_placed:
         return False
     
     # Build new frontmatter lines - preserve everything exactly except categories placement
@@ -1088,10 +1098,11 @@ def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_pat
         if i == insert_categories_after:
             new_fm_lines.append(fm_lines[i])  # Add title line
             
-            # Insert categories right after title
-            new_fm_lines.append('categories:')
-            for cat_path in sorted(all_category_paths):  # Sort for consistency
-                new_fm_lines.append(f"  - category: {cat_path}")
+            # Insert categories right after title (sync with mapping - only expected categories)
+            if expected_category_paths:
+                new_fm_lines.append('categories:')
+                for cat_path in sorted(expected_category_paths):  # Sort for consistency
+                    new_fm_lines.append(f"  - category: {cat_path}")
             
             # Continue to next iteration to skip old categories block if it exists
             continue
@@ -1168,6 +1179,30 @@ if __name__ == '__main__':
         if sys.argv[1] == '--update-categories':
             rules_dir = sys.argv[2] if len(sys.argv) > 2 else 'public/uploads/rules'
             update_all_mdx_categories(rules_dir)
+        elif sys.argv[1] == '--add-categories':
+            # Add categories flag for MD to MDX conversion
+            if len(sys.argv) > 2:
+                arg = sys.argv[2]
+                path = Path(arg)
+                if path.is_file():
+                    # For single file, load mappings
+                    script_dir = Path(__file__).parent
+                    repo_root = script_dir.parent.parent
+                    rule_to_cats_path = repo_root / 'rule-to-categories.json'
+                    rule_to_categories = None
+                    category_uri_to_path = None
+                    if rule_to_cats_path.exists():
+                        with open(rule_to_cats_path, 'r', encoding='utf-8') as f:
+                            rule_to_categories = json.load(f)
+                        category_uri_to_path = build_category_uri_to_path_map()
+                    transform_md_to_mdx(arg, rule_to_categories, category_uri_to_path)
+                elif path.is_dir():
+                    file_name = sys.argv[3] if len(sys.argv) > 3 else None
+                    transform_all_mds(arg, file_name, add_categories=True)
+                else:
+                    print(f"Error: The provided path '{arg}' is neither a file nor a directory.")
+            else:
+                transform_all_mds(add_categories=True)
         else:
             arg = sys.argv[1]
             path = Path(arg)
