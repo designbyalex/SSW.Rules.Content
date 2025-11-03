@@ -666,7 +666,7 @@ def transform_email_blocks(content: str) -> str:
 # Main Transform Function
 # ----------------------------- #
 
-def transform_md_to_mdx(file_path, rule_to_categories=None, category_uri_to_path=None):
+def transform_md_to_mdx(file_path, rule_to_categories=None, category_uri_to_path=None, auto_load_categories=True):
     path = Path(file_path)
     if not path.exists():
         print(f"File not found: {file_path}")
@@ -721,7 +721,25 @@ def transform_md_to_mdx(file_path, rule_to_categories=None, category_uri_to_path
 
     print(f"Transformed content saved to: {output_path}")
     
-    # Add categories to the newly converted MDX file if mappings are provided
+    # Add categories to the newly converted MDX file
+    # If mappings not provided but auto_load is enabled, try to load them
+    if auto_load_categories and (rule_to_categories is None or category_uri_to_path is None):
+        try:
+            script_dir = Path(__file__).parent
+            repo_root = script_dir.parent.parent
+            rule_to_cats_path = repo_root / 'rule-to-categories.json'
+            
+            if rule_to_cats_path.exists():
+                with open(rule_to_cats_path, 'r', encoding='utf-8') as f:
+                    rule_to_categories = json.load(f)
+                category_uri_to_path = build_category_uri_to_path_map()
+                print("[INFO] Auto-loaded category mappings.")
+            else:
+                print(f"[WARNING] rule-to-categories.json not found, skipping category updates.")
+        except Exception as e:
+            print(f"[WARNING] Failed to auto-load categories: {e}")
+    
+    # Add categories if mappings are available
     if rule_to_categories is not None and category_uri_to_path is not None:
         try:
             update_mdx_categories(str(output_path), rule_to_categories, category_uri_to_path)
@@ -730,7 +748,7 @@ def transform_md_to_mdx(file_path, rule_to_categories=None, category_uri_to_path
     
     path.unlink()  # delete original .md file
 
-def transform_all_mds(base_dir=DEFAULT_BASE_DIR, file_name=DEFAULT_FILE_NAME, add_categories=False):
+def transform_all_mds(base_dir=DEFAULT_BASE_DIR, file_name=DEFAULT_FILE_NAME, add_categories=True):
     """
     Transform all Markdown (.md) files in each subdirectory of the given base directory.
 
@@ -779,7 +797,8 @@ def transform_all_mds(base_dir=DEFAULT_BASE_DIR, file_name=DEFAULT_FILE_NAME, ad
 
             print(f"[INFO] Processing: {rule_md}")
             try:
-                transform_md_to_mdx(rule_md, rule_to_categories, category_uri_to_path)
+                # Pass auto_load_categories=False since we already loaded them if requested
+                transform_md_to_mdx(rule_md, rule_to_categories, category_uri_to_path, auto_load_categories=False)
                 count += 1
             except Exception as e:
                 print(f"[ERROR] Failed to process {rule_md}: {e}")
@@ -1343,11 +1362,14 @@ if __name__ == '__main__':
             arg = sys.argv[1]
             path = Path(arg)
             if path.is_file():
-                transform_md_to_mdx(arg)
+                # For single file, auto-load categories by default
+                transform_md_to_mdx(arg, auto_load_categories=True)
             elif path.is_dir():
                 file_name = sys.argv[2] if len(sys.argv) > 2 else None
-                transform_all_mds(arg, file_name)
+                # Categories enabled by default
+                transform_all_mds(arg, file_name, add_categories=True)
             else:
                 print(f"Error: The provided path '{arg}' is neither a file nor a directory.")
     else:
-        transform_all_mds()
+        # Categories enabled by default
+        transform_all_mds(add_categories=True)
