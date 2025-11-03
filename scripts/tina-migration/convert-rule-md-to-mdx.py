@@ -1045,11 +1045,107 @@ def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_pat
     new_categories_to_add = []
     
     
-    # Find title line index
+    # Find title line index and determine where title ends (handle multi-line titles)
     title_idx = None
+    title_end_idx = None
     for i, line in enumerate(fm_lines):
         if line.strip().startswith('title:'):
             title_idx = i
+            # Extract the title value part (after 'title:')
+            title_line = line
+            title_parts = line.split(':', 1)
+            if len(title_parts) > 1:
+                title_value_after_colon = title_parts[1].strip()
+            else:
+                title_value_after_colon = ''
+            
+            # In YAML, title can be on one line or span multiple lines
+            # If title value ends with a quote or looks complete, it's single line
+            # If the line doesn't end properly, it might continue
+            title_end_idx = i + 1  # Default: title ends on next line
+            
+            # Check if title continues on next lines (YAML multi-line values are indented)
+            j = i + 1
+            while j < len(fm_lines):
+                next_line = fm_lines[j]
+                stripped_next = next_line.strip()
+                
+                # Skip empty lines
+                if not stripped_next:
+                    j += 1
+                    continue
+                
+                # Check indentation - if next line is indented, it might be continuation
+                indent = len(next_line) - len(next_line.lstrip())
+                
+                # If line starts with a valid YAML key (no indent, has colon, valid key name), title ended
+                if indent == 0 and ':' in stripped_next:
+                    key_part = stripped_next.split(':', 1)[0].strip()
+                    # Valid key format (alphanumeric, dash, underscore)
+                    if key_part and all(c.isalnum() or c in '-_' for c in key_part.replace(' ', '')):
+                        # This is a new key, title ended at previous line
+                        title_end_idx = j
+                        break
+                
+                # If not indented and looks like content that should be part of title but isn't,
+                # it might be a broken title (like "audience?" on its own line)
+                # But we can't reliably detect this, so we'll assume any non-indented line with ':'
+                # that looks like a key is a new field
+                
+                # For indented lines without ':', they could be title continuation
+                # But we'll be conservative: only treat as continuation if clearly indented
+                if indent > 0 and ':' not in stripped_next:
+                    # Might be continuation, continue checking
+                    j += 1
+                    continue
+                
+                # If we get here and it's not clearly a continuation, assume title ended
+                if indent == 0:
+                    title_end_idx = j
+                    break
+                
+                j += 1
+            
+            # Special case: detect broken titles where continuation appears as unindented text
+            # (e.g., "title: Some text" followed by "more text?" on next line)
+            if j < len(fm_lines) and title_end_idx == i + 1:
+                # Check if title line doesn't end with punctuation and next line looks like continuation
+                title_line_ends_with_punct = title_value_after_colon and title_value_after_colon[-1] in '.!?'
+                if not title_line_ends_with_punct and j < len(fm_lines):
+                    next_non_empty = None
+                    for k in range(i + 1, min(j + 3, len(fm_lines))):
+                        if fm_lines[k].strip() and not fm_lines[k].strip().startswith('categories:'):
+                            next_non_empty = fm_lines[k]
+                            break
+                    
+                    if next_non_empty:
+                        next_stripped = next_non_empty.strip()
+                        # If next line doesn't look like a YAML key (no colon or invalid key format)
+                        # and title doesn't look complete, it might be continuation
+                        is_valid_key = False
+                        if ':' in next_stripped:
+                            key_part = next_stripped.split(':', 1)[0].strip()
+                            if key_part:
+                                is_valid_key = any(c.isalnum() or c in '-_' for c in key_part)
+                        if not is_valid_key:
+                            indent_next = len(next_non_empty) - len(next_non_empty.lstrip())
+                            # If not indented and looks like text (not a key), might be broken title
+                            if indent_next == 0:
+                                # Look ahead to find where the next actual key starts
+                                for k in range(j, len(fm_lines)):
+                                    check_line = fm_lines[k]
+                                    if check_line.strip() and ':' in check_line.strip():
+                                        key_check = check_line.strip().split(':', 1)[0].strip()
+                                        if key_check and all(c.isalnum() or c in '-_' for c in key_check.replace(' ', '')):
+                                            title_end_idx = k
+                                            break
+                                # If we didn't find a clear key, include the continuation line
+                                if title_end_idx == i + 1 and j < len(fm_lines):
+                                    title_end_idx = j + 1
+            
+            # If we didn't find a clear end, title ends after the title line itself
+            if title_end_idx > len(fm_lines):
+                title_end_idx = i + 1
             break
     
     if title_idx is None:
@@ -1085,30 +1181,70 @@ def update_mdx_categories(mdx_file_path, rule_to_categories, category_uri_to_pat
     
     # Build new frontmatter lines - preserve everything exactly except categories placement
     new_fm_lines = []
-    insert_categories_after = title_idx
+    insert_categories_after = title_end_idx  # Insert after title ends (handles multi-line titles)
     
     # Determine what to skip (the old categories block if it exists)
     skip_range = set()
     if categories_start_idx is not None:
         skip_range = set(range(categories_start_idx, categories_end_idx))
     
+    # Check for broken title pattern: title line, then categories, then orphaned text that should be part of title
+    title_continuation_after_categories = None
+    if categories_start_idx is not None and categories_start_idx > title_idx:
+        # Check if there's text after categories that looks like title continuation
+        if categories_end_idx < len(fm_lines):
+            next_line_after_cats = fm_lines[categories_end_idx].strip()
+            # If next line doesn't have ':' (not a key) and looks like text, might be title continuation
+            if next_line_after_cats and ':' not in next_line_after_cats:
+                # Check if it could be title continuation (ends with ? or looks like sentence end)
+                if next_line_after_cats.endswith('?') or (len(next_line_after_cats) < 50 and 
+                    not next_line_after_cats[0].isupper() and 
+                    all(c.isalnum() or c in " '-?!" for c in next_line_after_cats)):
+                    # Check if line after that is a proper key
+                    if categories_end_idx + 1 < len(fm_lines):
+                        line_after = fm_lines[categories_end_idx + 1].strip()
+                        if ':' in line_after:
+                            key_part = line_after.split(':', 1)[0].strip()
+                            if key_part and all(c.isalnum() or c in '-_' for c in key_part):
+                                # This looks like title continuation that got orphaned
+                                title_continuation_after_categories = categories_end_idx
+                                # Extend title_end_idx to include this continuation
+                                title_end_idx = categories_end_idx + 1
+    
     # Process each line, inserting categories after title
     for i in range(len(fm_lines)):
+        # Add all title lines first (including multi-line titles and any orphaned continuation)
+        if i < title_end_idx:
+            # If this is an orphaned continuation line, merge it with the title
+            if i == title_continuation_after_categories:
+                # Merge with previous title line
+                if new_fm_lines and new_fm_lines[-1].strip().startswith('title:'):
+                    # Append continuation to title value
+                    last_line = new_fm_lines[-1]
+                    continuation = fm_lines[i].strip()
+                    # Merge: add space and continuation
+                    if ':' in last_line:
+                        title_parts = last_line.split(':', 1)
+                        merged_title = f"{title_parts[0]}: {title_parts[1].rstrip()} {continuation}"
+                        new_fm_lines[-1] = merged_title
+                    continue
+            new_fm_lines.append(fm_lines[i])
+            continue
+        
         # If this is where title ends, insert categories here
-        if i == insert_categories_after:
-            new_fm_lines.append(fm_lines[i])  # Add title line
-            
+        if i == title_end_idx:
             # Insert categories right after title (sync with mapping - only expected categories)
             if expected_category_paths:
                 new_fm_lines.append('categories:')
                 for cat_path in sorted(expected_category_paths):  # Sort for consistency
                     new_fm_lines.append(f"  - category: {cat_path}")
-            
-            # Continue to next iteration to skip old categories block if it exists
-            continue
         
         # Skip lines that are part of the old categories block
         if i in skip_range:
+            continue
+        
+        # Skip orphaned title continuation (we already merged it)
+        if i == title_continuation_after_categories:
             continue
         
         # Add all other lines as-is
